@@ -1,0 +1,80 @@
+import { readFile } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const { PGlite } = await import(process.env.PGLITE_MODULE || '@electric-sql/pglite');
+const db = new PGlite();
+// Minimal Supabase Auth and Storage compatibility shim for a disposable PostgreSQL database.
+await db.exec(`
+create role anon; create role authenticated;
+create schema auth; create table auth.users(id uuid primary key);
+create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;
+grant usage on schema auth to authenticated;grant execute on function auth.uid() to authenticated;
+create schema storage;
+create table storage.buckets(id text primary key,name text,public boolean);
+create table storage.objects(id uuid primary key default gen_random_uuid(),bucket_id text,name text,owner_id text);
+alter table storage.objects enable row level security;
+create function storage.foldername(name text) returns text[] language sql immutable as $$ select (string_to_array(name,'/'))[1:array_length(string_to_array(name,'/'),1)-1] $$;
+`);
+const migration = await readFile(new URL('../migrations/001_school.sql', import.meta.url),'utf8');
+await db.exec(migration.replace('create extension if not exists pgcrypto;',''));
+console.log('PASS: complete schema and functions compile in PostgreSQL');
+const ids = { student:'00000000-0000-0000-0000-000000000001', teacher:'00000000-0000-0000-0000-000000000002', principal:'00000000-0000-0000-0000-000000000003', parent:'00000000-0000-0000-0000-000000000004', stranger:'00000000-0000-0000-0000-000000000005', unrelated:'00000000-0000-0000-0000-000000000006' };
+await db.exec(`insert into public.schools values('school-a','School A'),('school-b','School B');`);
+for(const id of Object.values(ids)) await db.query('insert into auth.users values($1)',[id]);
+for(const [role,school,classes,children] of [ ['student','school-a',['10-A'],[]],['teacher','school-a',['10-A'],[]],['principal','school-a',[],[]],['parent','school-a',[],[ids.student]],['stranger','school-b',['10-A'],[]],['unrelated','school-a',['9-B'],[]] ]) {
+  await db.query('insert into public.school_members values($1,$2,$3,$4,$5,$6)',[ids[role],school,role, ['stranger','unrelated'].includes(role)?'student':role,classes,children]);
+}
+const record = async (id,kind,data,{school='school-a',group=null,student=null,owner=null}={}) => db.query('insert into public.school_records(id,school_id,kind,class_id,student_id,owner_id,data) values($1,$2,$3,$4,$5,$6,$7)',[id,school,kind,group,student,owner,data]);
+await record('class-a','class',{title:'10-A'},{group:'10-A'});await record('class-b','class',{title:'9-B'},{group:'9-B'});await record('class-other','class',{title:'10-A'},{school:'school-b',group:'10-A'});
+await record(ids.student,'student',{name:'Student',roll:'1'},{group:'10-A',student:ids.student});await record(ids.unrelated,'student',{name:'Other',roll:'1'},{group:'9-B',student:ids.unrelated});await record(ids.stranger,'student',{name:'Stranger',roll:'1'},{school:'school-b',group:'10-A',student:ids.stranger});
+await record('draft-mark','mark',{subject:'Math',score:8,max:10,published:false},{group:'10-A',student:ids.student});
+await record('book','book',{title:'Test Book',copies:1});
+await record('leave','leave',{name:'Student',reason:'Appointment',from:'2026-10-06',to:'2026-10-06',status:'Pending',type:'Student'},{student:ids.student,group:'10-A',owner:ids.parent});
+async function login(role) { await db.exec('reset role'); await db.query("select set_config('request.jwt.claim.sub',$1,false)",[ids[role]]); await db.exec('set role authenticated'); }
+async function fails(sql,params=[]) { let rejected=false;try { await db.query(sql,params); } catch { rejected=true; } assert(rejected,`Expected rejection: ${sql}`); }
+async function records() { const result=await db.query('select public.load_school_records() as rows');return result.rows[0].rows; }
+await login('student');let visible=await records();assert(!visible.some(r=>r.id==='draft-mark'));assert(!visible.some(r=>r.school_id==='school-b'));assert(!visible.some(r=>r.id===ids.unrelated));
+await fails('update public.school_members set role=$1 where user_id=$2',['principal',ids.student]);
+await fails('insert into public.school_records(id,school_id,kind,class_id,student_id,data) values($1,$2,$3,$4,$5,$6)',['fake-mark','school-a','mark','10-A',ids.student,{score:100,max:100}]);
+await fails('select * from public.exam_keys');
+console.log('PASS: cross-school access, unrelated students, unpublished marks, role escalation and answer keys are blocked');
+await login('teacher');
+const exam={id:'exam',school_id:'school-a',kind:'exam',class_id:'10-A',owner_id:ids.teacher,data:{title:'Mixed test',subject:'Math',minutes:15,published:true,questions:[{id:'q1',prompt:'2+2?',type:'mcq',options:['3','4'],points:5},{id:'q2',prompt:'Show working',type:'written',options:[],points:5}]}};
+await db.query('select public.create_exam($1,$2,$3)',[exam,{q1:1},true]);assert((await records()).some(r=>r.kind==='question' && r.data.correct===1));
+await fails('select public.create_exam($1,$2)',[{...exam,id:'forbidden',class_id:'9-B'},{q1:1}]);
+console.log('PASS: teachers can create tests only for assigned classes');
+await login('student');
+assert(!(await records()).some(r=>r.kind==='question'));
+const start=await db.query('select public.exam_action($1,$2,$3) as attempt',['start','exam',{}]);const attemptId=start.rows[0].attempt.id;
+const repeat=await db.query('select public.exam_action($1,$2,$3) as attempt',['start','exam',{}]);assert.equal(repeat.rows[0].attempt.id,attemptId);
+await db.query('select public.exam_action($1,$2,$3)',['save','exam',{q1:1,q2:'2 plus 2 is 4'}]);
+const submitted=await db.query('select public.exam_action($1,$2,$3) as attempt',['submit','exam',{q1:1,q2:'2 plus 2 is 4'}]);assert.equal(submitted.rows[0].attempt.data.status,'Awaiting review');assert.equal(submitted.rows[0].attempt.data.score,undefined);
+const hidden=await db.query('select * from public.exam_results');assert.equal(hidden.rows.length,0);
+await fails('select public.review_attempt($1,$2,$3,$4)',[attemptId,{q2:5},'Forged',true]);
+console.log('PASS: single attempts, server grading, private unpublished scores and student grading rejection');
+await login('teacher');
+visible=await records();assert.equal(visible.find(r=>r.id===attemptId).data.score,5);
+await fails('select public.review_attempt($1,$2,$3,$4)',[attemptId,{q2:6},'Too many',true]);
+await db.query('select public.review_attempt($1,$2,$3,$4)',[attemptId,{q2:4},'Good work',false]);
+await db.query('select public.review_attempt($1,$2,$3,$4)',[attemptId,{q2:5},'Great work',true]);
+await login('parent');visible=await records();assert.equal(visible.find(r=>r.id===attemptId).data.score,10);
+console.log('PASS: written-answer bounds, repeat grading and parent access to published results');
+await login('stranger');await fails('select public.exam_action($1,$2,$3)',['start','exam',{}]);assert(!(await records()).some(r=>r.school_id==='school-a'));
+await login('student');await db.query('select public.borrow_book($1)',['book']);await fails('select public.borrow_book($1)',['book']);
+await login('principal');const loans=(await records()).filter(r=>r.kind==='borrow');await db.query('select public.return_book($1)',[loans[0].id]);
+await login('student');await db.query('select public.borrow_book($1)',['book']);
+console.log('PASS: duplicate borrowing blocked and returned books can be borrowed again');
+await login('parent');await fails('update public.school_records set data=data||$1 where id=$2',[{status:'Approved'},'leave']);assert.equal((await records()).find(r=>r.id==='leave').data.status,'Pending');
+await login('principal');await db.query('update public.school_records set data=data||$1 where id=$2',[{status:'Approved'},'leave']);
+await login('parent');assert.equal((await records()).find(r=>r.id==='leave').data.status,'Approved');
+console.log('PASS: only leadership can approve leave');
+await login('student');await fails('select public.record_json($1)',[{}]);
+console.log('PASS: internal serialization cannot be called with fabricated record scopes');
+await login('teacher');await db.query('select public.create_exam($1,$2)',[{...exam,id:'expired-exam'},{q1:1}]);
+await login('student');await db.query('select public.exam_action($1,$2,$3)',['start','expired-exam',{}]);await db.query('select public.exam_action($1,$2,$3)',['save','expired-exam',{q1:0}]);
+await db.exec('reset role');await db.query("select set_config('schoolsphere.internal','yes',false)");await db.query("update public.school_records set data=data||jsonb_build_object('deadline',now()-interval '1 second') where kind='attempt' and data->>'exam'='expired-exam'");await db.query("select set_config('schoolsphere.internal','no',false)");
+await login('student');await db.query('select public.exam_action($1,$2,$3)',['submit','expired-exam',{q1:1}]);
+await login('teacher');assert.equal((await records()).find(r=>r.data.exam==='expired-exam').data.score,0);
+console.log('PASS: expired submissions use the server deadline and previously saved answers');
+await login('student');await fails('insert into public.school_records(id,school_id,kind,owner_id,data) values($1,$2,$3,$4,$5)',['forbidden-message','school-a','message',ids.student,{body:'Not allowed',recipients:[ids.student,ids.stranger]}]);
+console.log('PASS: messaging cannot cross school boundaries');
+await db.close();console.log('All database permission and assessment checks passed.');

@@ -1,0 +1,3 @@
+project_id = "schoolsphere"
+[functions.send-notification]
+verify_jwt = true

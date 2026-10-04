@@ -1,0 +1,1 @@
+These are actual Flutter screens rendered at 390×844 logical pixels (2× output resolution), plus a 1440×1000 desktop view. All identities and school records are fictional. Sample captures use Monday, 5 October 2026. Run the capture test to regenerate screenshots after UI changes. No client results or business impact are implied by demo dashboard numbers.

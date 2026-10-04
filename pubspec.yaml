@@ -1,0 +1,36 @@
+name: schoolsphere
+description: A complete school day, beautifully connected. A Flutter portfolio project by InGrowwth Innovations.
+publish_to: none
+version: 1.0.0+1
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: ^3.4.3
+  go_router: ^18.0.2
+  supabase_flutter: ^2.10.0
+  sqflite: ^2.4.2
+  shared_preferences: ^2.5.3
+  intl: ^0.20.2
+  firebase_core: ^4.0.0
+  firebase_messaging: ^16.0.0
+  url_launcher: ^6.3.2
+  pdf: ^3.11.3
+  printing: ^5.14.2
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/fonts/
+  fonts:
+    - family: Manrope
+      fonts:
+        - asset: assets/fonts/Manrope.ttf
+    - family: Fraunces
+      fonts:
+        - asset: assets/fonts/Fraunces.ttf
